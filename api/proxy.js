@@ -1,12 +1,10 @@
 // WheelPicks API Proxy — Vercel Serverless Function
-// Uses Massive.com (formerly Polygon.io) for options + quotes
+// Uses Yahoo Finance with crumb+cookie auth (same method as ArkPicks)
 
-const MASSIVE_KEY   = "kIjvBYnuGohoHzCO5wVmAjNuBoQjMwtr";
-const GEMINI_KEY    = "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
-const SUPABASE_URL  = "https://qpcugczsqsjnodlgdver.supabase.co";
-const SERVICE_KEY   = "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
-const REST          = `${SUPABASE_URL}/rest/v1`;
-const MASSIVE_BASE  = "https://api.massive.com";  // new base URL after rebrand
+const GEMINI_KEY   = "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
+const SUPABASE_URL = "https://qpcugczsqsjnodlgdver.supabase.co";
+const SERVICE_KEY  = "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
+const REST         = `${SUPABASE_URL}/rest/v1`;
 
 const OPTIONS_TTL_MS = 4 * 60 * 60 * 1000;
 const QUOTES_TTL_MS  = 5 * 60 * 1000;
@@ -76,104 +74,115 @@ async function upsertQuote(ticker, price) {
   await dbUpsert("quotes_cache", { ticker, price, updated_at: new Date().toISOString() });
 }
 
-// ── Massive.com API helpers ────────────────────────────────
+// ── Yahoo Finance crumb+cookie auth ────────────────────────
 
-async function massiveGet(path) {
-  // Try new base first, fall back to polygon.io
-  for (const base of [MASSIVE_BASE, "https://api.polygon.io"]) {
+const YAHOO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Cache crumb in memory for the lifetime of this serverless instance
+let _crumb = null;
+let _cookie = null;
+let _crumbTs = 0;
+const CRUMB_TTL = 30 * 60 * 1000; // 30 minutes
+
+async function getYahooCrumb() {
+  // Return cached crumb if still fresh
+  if (_crumb && _cookie && (Date.now() - _crumbTs) < CRUMB_TTL) {
+    return { crumb: _crumb, cookie: _cookie };
+  }
+
+  // Step 1: Get a Yahoo session cookie by visiting the consent page
+  const consentUrl = "https://guce.yahoo.com/consent?brandType=nonEu&lang=en-US&intl=us";
+  try {
+    const consentRes = await fetch(consentUrl, {
+      headers: {
+        "User-Agent": YAHOO_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+    });
+    const rawCookies = consentRes.headers.get("set-cookie") || "";
+    // Extract A1 or B cookie
+    const cookieMatch = rawCookies.match(/(?:A1|B)=[^;]+/);
+    if (cookieMatch) _cookie = cookieMatch[0];
+  } catch (_) {}
+
+  // Step 2: If no cookie yet, try a direct quote page visit
+  if (!_cookie) {
     try {
-      const url = `${base}${path}${path.includes("?") ? "&" : "?"}apiKey=${MASSIVE_KEY}`;
-      const r = await fetch(url, { headers: { "Accept": "application/json" } });
+      const quoteRes = await fetch("https://finance.yahoo.com/quote/AAPL", {
+        headers: {
+          "User-Agent": YAHOO_UA,
+          "Accept": "text/html",
+        },
+        redirect: "follow",
+      });
+      const rawCookies = quoteRes.headers.get("set-cookie") || "";
+      const cookieMatch = rawCookies.match(/(?:A1|B)=[^;]+/);
+      if (cookieMatch) _cookie = cookieMatch[0];
+    } catch (_) {}
+  }
+
+  // Step 3: Get crumb using the cookie
+  const crumbHeaders = {
+    "User-Agent": YAHOO_UA,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+    "Origin": "https://finance.yahoo.com",
+  };
+  if (_cookie) crumbHeaders["Cookie"] = _cookie;
+
+  for (const host of ["query1", "query2"]) {
+    try {
+      const r = await fetch(`https://${host}.finance.yahoo.com/v1/test/getcrumb`, {
+        headers: crumbHeaders,
+      });
       if (r.ok) {
-        const j = await r.json();
-        if (j.status !== "ERROR" && j.status !== "NOT_AUTHORIZED") return j;
+        const text = await r.text();
+        if (text && text.length > 0 && !text.includes("Unauthorized")) {
+          _crumb = text.trim();
+          _crumbTs = Date.now();
+          console.log(`Got Yahoo crumb: ${_crumb?.substring(0,8)}... cookie: ${!!_cookie}`);
+          return { crumb: _crumb, cookie: _cookie };
+        }
       }
     } catch (_) {}
   }
-  return null;
+
+  console.log("Failed to get Yahoo crumb");
+  return { crumb: null, cookie: _cookie };
 }
 
-async function fetchMassiveQuote(ticker) {
-  // Try snapshot first (most reliable)
-  const snap = await massiveGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-  const price = snap?.ticker?.day?.c || snap?.ticker?.prevDay?.c || snap?.ticker?.lastTrade?.p;
-  if (price) return parseFloat(price.toFixed(2));
-
-  // Fallback: previous close
-  const prev = await massiveGet(`/v2/aggs/ticker/${ticker}/prev?adjusted=true`);
-  const close = prev?.results?.[0]?.c;
-  if (close) return parseFloat(close.toFixed(2));
-
-  return null;
-}
-
-async function fetchMassiveOptions(ticker, expDate) {
-  // Get options snapshot with Greeks
-  let path = `/v3/snapshot/options/${ticker}?limit=250&contract_type=put`;
-  if (expDate) path += `&expiration_date=${expDate}`;
-
-  const putsData = await massiveGet(path);
-  const callsPath = path.replace("contract_type=put", "contract_type=call");
-  const callsData = await massiveGet(callsPath);
-
-  if (!putsData?.results?.length && !callsData?.results?.length) return null;
-
-  function transformContracts(results) {
-    return (results || []).map(opt => {
-      const d = opt.details || {};
-      const g = opt.greeks || {};
-      const day = opt.day || {};
-      const quote = opt.last_quote || {};
-      const bid = parseFloat((quote.bid || 0).toFixed(2));
-      const ask = parseFloat((quote.ask || 0).toFixed(2));
-      const mid = bid > 0 && ask > 0 ? parseFloat(((bid + ask) / 2).toFixed(2)) : (day.close || 0);
-      return {
-        strike:            d.strike_price || 0,
-        lastPrice:         parseFloat((mid).toFixed(2)),
-        bid,
-        ask,
-        openInterest:      opt.open_interest || 0,
-        volume:            day.volume || 0,
-        impliedVolatility: parseFloat(((opt.implied_volatility || 0) * 100).toFixed(1)),
-        delta:             parseFloat((g.delta || 0).toFixed(4)),
-        theta:             parseFloat((g.theta || 0).toFixed(4)),
-        gamma:             parseFloat((g.gamma || 0).toFixed(4)),
-        vega:              parseFloat((g.vega || 0).toFixed(4)),
-        expiration:        d.expiration_date || expDate,
-      };
-    }).filter(c => c.strike > 0);
-  }
-
-  const puts  = transformContracts(putsData?.results).sort((a,b) => b.strike - a.strike);
-  const calls = transformContracts(callsData?.results).sort((a,b) => a.strike - b.strike);
-
-  // Get current price from underlying
-  const underlyingPrice = putsData?.results?.[0]?.underlying?.price ||
-                          callsData?.results?.[0]?.underlying?.price || 0;
-
-  // Gather all unique expiration dates from results
-  const allResults = [...(putsData?.results || []), ...(callsData?.results || [])];
-  const expDates = [...new Set(allResults.map(o => o.details?.expiration_date).filter(Boolean))].sort();
-  const expTimestamps = expDates.map(d => Math.floor(new Date(d + "T16:00:00Z").getTime() / 1000));
-
-  const expTs = expDate ? Math.floor(new Date(expDate + "T16:00:00Z").getTime() / 1000) : (expTimestamps[0] || 0);
-
-  return {
-    optionChain: {
-      result: [{
-        underlyingSymbol: ticker,
-        expirationDates: expTimestamps,
-        strikes: [...new Set([...puts, ...calls].map(o => o.strike))].sort((a,b) => a-b),
-        quote: { regularMarketPrice: underlyingPrice },
-        options: [{ expirationDate: expTs, puts, calls }]
-      }]
-    }
+async function yahooFetch(url, crumb, cookie) {
+  const fullUrl = crumb ? `${url}${url.includes("?") ? "&" : "?"}crumb=${encodeURIComponent(crumb)}` : url;
+  const headers = {
+    "User-Agent": YAHOO_UA,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+    "Origin": "https://finance.yahoo.com",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
   };
-}
+  if (cookie) headers["Cookie"] = cookie;
 
-function tsToDate(ts) {
-  const d = new Date(ts * 1000);
-  return d.toISOString().split("T")[0];
+  for (const host of ["query1", "query2"]) {
+    try {
+      const hostUrl = fullUrl.replace(/query[12]/, host);
+      const r = await fetch(hostUrl, { headers });
+      if (r.ok) {
+        const j = await r.json();
+        // Check for auth errors
+        if (j?.finance?.error?.code === "Unauthorized") continue;
+        if (j?.optionChain?.error?.code === "Unauthorized") continue;
+        return j;
+      }
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return null;
 }
 
 // ── Main handler ───────────────────────────────────────────
@@ -215,31 +224,29 @@ export default async function handler(req, res) {
         res.setHeader("X-Cache", "HIT");
         return res.status(200).json({ chart: { result: [{ meta: { regularMarketPrice: cached } }] } });
       }
-      const price = await fetchMassiveQuote(ticker);
-      if (price) {
-        upsertQuote(ticker, price);
-        res.setHeader("X-Cache", "MISS");
-        return res.status(200).json({ chart: { result: [{ meta: { regularMarketPrice: price } }] } });
-      }
-      return res.status(200).json({ chart: { result: [] } });
+      const { crumb, cookie } = await getYahooCrumb();
+      const json = await yahooFetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`,
+        crumb, cookie
+      );
+      const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice;
+      if (price) upsertQuote(ticker, parseFloat(price.toFixed(2)));
+      res.setHeader("X-Cache", "MISS");
+      return res.status(200).json(json || { chart: { result: [] } });
     }
 
     // ── News ───────────────────────────────────────────────
     if (type === "news") {
-      try {
-        const r = await fetch(
-          `https://query1.finance.yahoo.com/v1/finance/search?q=${ticker}&newsCount=5&quotesCount=0`,
-          { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-        );
-        return res.status(200).json(await r.json());
-      } catch (_) {
-        return res.status(200).json({ news: [] });
-      }
+      const { crumb, cookie } = await getYahooCrumb();
+      const json = await yahooFetch(
+        `https://query1.finance.yahoo.com/v1/finance/search?q=${ticker}&newsCount=5&quotesCount=0`,
+        crumb, cookie
+      );
+      return res.status(200).json(json || { news: [] });
     }
 
     // ── Options chain ──────────────────────────────────────
     const expTs = exp ? parseInt(exp) : 0;
-    const expDate = expTs > 0 ? tsToDate(expTs) : "";
 
     // 1. Fresh cache
     const fresh = await getCachedOptions(ticker, expTs);
@@ -248,10 +255,20 @@ export default async function handler(req, res) {
       return res.status(200).json(fresh);
     }
 
-    // 2. Live from Massive
-    const live = await fetchMassiveOptions(ticker, expDate);
-    if (live) {
+    // 2. Live from Yahoo with crumb auth
+    const { crumb, cookie } = await getYahooCrumb();
+    const baseUrl = expTs > 0
+      ? `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${expTs}`
+      : `https://query1.finance.yahoo.com/v7/finance/options/${ticker}`;
+
+    const live = await yahooFetch(baseUrl, crumb, cookie);
+    const hasData = live?.optionChain?.result?.length > 0 &&
+      (live.optionChain.result[0].options?.[0]?.puts?.length > 0 ||
+       live.optionChain.result[0].options?.[0]?.calls?.length > 0);
+
+    if (hasData) {
       upsertOptions(ticker, expTs, live);
+      if (expTs > 0) upsertOptions(ticker, 0, live);
       res.setHeader("X-Cache", "MISS");
       return res.status(200).json(live);
     }
@@ -268,7 +285,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ optionChain: { result: [] } });
 
   } catch (err) {
+    console.error("Handler error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 }
-
