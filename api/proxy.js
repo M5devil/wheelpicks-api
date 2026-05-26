@@ -1,30 +1,14 @@
 // WheelPicks API Proxy — Vercel Serverless Function
-// Vercel IPs are not blocked by Yahoo Finance unlike AWS/Supabase
+// Uses Massive.com (formerly Polygon.io) for options data — never blocked
 
-const GEMINI_KEY   = process.env.GEMINI_KEY   || "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
-const SUPABASE_URL = process.env.SUPABASE_URL  || "https://qpcugczsqsjnodlgdver.supabase.co";
-const SERVICE_KEY  = process.env.SERVICE_KEY   || "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
-const REST         = `${SUPABASE_URL}/rest/v1`;
+const MASSIVE_KEY   = "kIjvBYnuGohoHzCO5wVmAjNuBoQjMwtr";
+const GEMINI_KEY    = process.env.GEMINI_KEY  || "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
+const SUPABASE_URL  = "https://qpcugczsqsjnodlgdver.supabase.co";
+const SERVICE_KEY   = "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
+const REST          = `${SUPABASE_URL}/rest/v1`;
 
 const OPTIONS_TTL_MS = 4 * 60 * 60 * 1000;  // 4 hours
 const QUOTES_TTL_MS  = 5 * 60 * 1000;        // 5 minutes
-
-const YAHOO_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept": "application/json, text/plain, */*",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Referer": "https://finance.yahoo.com/",
-  "Origin": "https://finance.yahoo.com",
-  "Sec-Fetch-Dest": "empty",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Site": "same-site",
-};
-
-const DB_HEADERS = {
-  "apikey": SERVICE_KEY,
-  "Authorization": `Bearer ${SERVICE_KEY}`,
-  "Content-Type": "application/json",
-};
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -33,7 +17,13 @@ const CORS = {
   "Content-Type": "application/json",
 };
 
-// ── Supabase REST helpers ──────────────────────────────────
+const DB_HEADERS = {
+  "apikey": SERVICE_KEY,
+  "Authorization": `Bearer ${SERVICE_KEY}`,
+  "Content-Type": "application/json",
+};
+
+// ── Supabase cache helpers ─────────────────────────────────
 
 async function dbGet(table, params) {
   try {
@@ -89,44 +79,108 @@ async function upsertQuote(ticker, price) {
   });
 }
 
-// ── Yahoo helpers ──────────────────────────────────────────
+// ── Massive.com (Polygon) helpers ──────────────────────────
 
-async function fetchYahooOptions(ticker, expTs) {
-  for (const q of ["query1", "query2"]) {
-    const url = expTs
-      ? `https://${q}.finance.yahoo.com/v7/finance/options/${ticker}?date=${expTs}`
-      : `https://${q}.finance.yahoo.com/v7/finance/options/${ticker}`;
-    try {
-      const r = await fetch(url, { headers: YAHOO_HEADERS });
-      if (!r.ok) continue;
-      const j = await r.json();
-      if (j?.optionChain?.result?.length > 0) return j;
-    } catch (_) {}
-    await new Promise(r => setTimeout(r, 200));
-  }
+async function fetchMassiveQuote(ticker) {
+  try {
+    const r = await fetch(
+      `https://api.polygon.io/v2/last/trade/${ticker}?apiKey=${MASSIVE_KEY}`
+    );
+    const j = await r.json();
+    const price = j?.results?.p;
+    if (price) return parseFloat(price.toFixed(2));
+
+    // Fallback: previous close
+    const r2 = await fetch(
+      `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${MASSIVE_KEY}`
+    );
+    const j2 = await r2.json();
+    const close = j2?.results?.[0]?.c;
+    if (close) return parseFloat(close.toFixed(2));
+  } catch (_) {}
   return null;
 }
 
-async function fetchYahooQuote(ticker) {
-  for (const q of ["query1", "query2"]) {
-    try {
-      const r = await fetch(
-        `https://${q}.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`,
-        { headers: YAHOO_HEADERS }
-      );
-      if (!r.ok) continue;
-      const j = await r.json();
-      const price = j?.chart?.result?.[0]?.meta?.regularMarketPrice;
-      if (price) return { json: j, price: parseFloat(price.toFixed(2)) };
-    } catch (_) {}
+async function fetchMassiveOptions(ticker, expDate) {
+  // expDate format: "2026-06-20"
+  try {
+    let url = `https://api.polygon.io/v3/snapshot/options/${ticker}?limit=250&apiKey=${MASSIVE_KEY}`;
+    if (expDate) url += `&expiration_date=${expDate}`;
+
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j?.results?.length) return null;
+
+    // Transform Massive snapshot format → Yahoo-compatible format
+    // that WheelPicks frontend already knows how to parse
+    const puts = [];
+    const calls = [];
+
+    j.results.forEach(opt => {
+      const d = opt.details || {};
+      const g = opt.greeks || {};
+      const day = opt.day || {};
+      const contract = {
+        strike:         d.strike_price,
+        lastPrice:      opt.last_trade?.price || day.close || 0,
+        bid:            opt.last_quote?.bid || 0,
+        ask:            opt.last_quote?.ask || 0,
+        openInterest:   opt.open_interest || 0,
+        volume:         day.volume || 0,
+        impliedVolatility: opt.implied_volatility || 0,
+        delta:          g.delta || 0,
+        theta:          g.theta || 0,
+        gamma:          g.gamma || 0,
+        vega:           g.vega || 0,
+      };
+      // Use mid price as premium
+      if (contract.bid > 0 && contract.ask > 0) {
+        contract.lastPrice = parseFloat(((contract.bid + contract.ask) / 2).toFixed(2));
+      }
+      if (d.contract_type === "put") puts.push(contract);
+      else if (d.contract_type === "call") calls.push(contract);
+    });
+
+    // Sort by strike descending (ITM first for puts)
+    puts.sort((a, b) => b.strike - a.strike);
+    calls.sort((a, b) => a.strike - b.strike);
+
+    // Get unique expiration dates from results
+    const expDates = [...new Set(j.results.map(o => o.details?.expiration_date).filter(Boolean))];
+    const expTimestamps = expDates.map(d => Math.floor(new Date(d).getTime() / 1000));
+
+    // Wrap in Yahoo-compatible envelope so existing frontend code works unchanged
+    return {
+      optionChain: {
+        result: [{
+          underlyingSymbol: ticker,
+          expirationDates: expTimestamps,
+          strikes: [...new Set([...puts, ...calls].map(o => o.strike))].sort((a,b) => a-b),
+          quote: { regularMarketPrice: opt?.underlying?.price || 0 },
+          options: [{
+            expirationDate: expDate ? Math.floor(new Date(expDate).getTime()/1000) : expTimestamps[0],
+            puts,
+            calls
+          }]
+        }]
+      }
+    };
+  } catch (e) {
+    console.log("Massive options error:", e.message);
+    return null;
   }
-  return null;
+}
+
+// Convert unix timestamp to YYYY-MM-DD
+function tsToDate(ts) {
+  const d = new Date(ts * 1000);
+  return d.toISOString().split("T")[0];
 }
 
 // ── Main handler ───────────────────────────────────────────
 
 export default async function handler(req, res) {
-  // CORS preflight
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "authorization, x-client-info, apikey, content-type");
@@ -134,14 +188,13 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Set CORS on all responses
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
 
   const { ticker = "", type = "quote", exp = "" } = req.query;
 
   try {
 
-    // ── Gemini AI ────────────────────────────────────────────
+    // ── Gemini AI ──────────────────────────────────────────
     if (type === "gemini_news" || type === "gemini_sellers") {
       const body = req.body || {};
       const useSearch = type === "gemini_news";
@@ -157,7 +210,7 @@ export default async function handler(req, res) {
       return res.status(200).json(await r.json());
     }
 
-    // ── Quote ─────────────────────────────────────────────────
+    // ── Quote ──────────────────────────────────────────────
     if (type === "quote") {
       // 1. Cache
       const cached = await getCachedQuote(ticker);
@@ -167,43 +220,43 @@ export default async function handler(req, res) {
           chart: { result: [{ meta: { regularMarketPrice: cached } }] }
         });
       }
-      // 2. Live
-      const result = await fetchYahooQuote(ticker);
-      if (result) {
-        upsertQuote(ticker, result.price);
+      // 2. Live from Massive
+      const price = await fetchMassiveQuote(ticker);
+      if (price) {
+        upsertQuote(ticker, price);
         res.setHeader("X-Cache", "MISS");
-        return res.status(200).json(result.json);
+        return res.status(200).json({
+          chart: { result: [{ meta: { regularMarketPrice: price } }] }
+        });
       }
       return res.status(200).json({ chart: { result: [] } });
     }
 
-    // ── News ──────────────────────────────────────────────────
+    // ── News (still use Yahoo for news since it's not blocked) ──
     if (type === "news") {
       const r = await fetch(
         `https://query1.finance.yahoo.com/v1/finance/search?q=${ticker}&newsCount=5&quotesCount=0`,
-        { headers: YAHOO_HEADERS }
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
       );
       return res.status(200).json(await r.json());
     }
 
-    // ── Options chain ─────────────────────────────────────────
+    // ── Options chain ──────────────────────────────────────
     const expTs = exp ? parseInt(exp) : 0;
+    const expDate = expTs > 0 ? tsToDate(expTs) : "";
 
     // 1. Fresh cache
     const fresh = await getCachedOptions(ticker, expTs);
     if (fresh) {
       res.setHeader("X-Cache", "HIT");
-      res.setHeader("Cache-Control", "public, max-age=300");
       return res.status(200).json(fresh);
     }
 
-    // 2. Live fetch (Vercel IPs work with Yahoo)
-    const live = await fetchYahooOptions(ticker, expTs > 0 ? String(expTs) : undefined);
+    // 2. Live from Massive
+    const live = await fetchMassiveOptions(ticker, expDate);
     if (live) {
       upsertOptions(ticker, expTs, live);
-      if (expTs > 0) upsertOptions(ticker, 0, live);
       res.setHeader("X-Cache", "MISS");
-      res.setHeader("Cache-Control", "public, max-age=300");
       return res.status(200).json(live);
     }
 
