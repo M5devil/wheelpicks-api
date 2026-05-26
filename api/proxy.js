@@ -1,14 +1,15 @@
 // WheelPicks API Proxy — Vercel Serverless Function
-// Uses Massive.com (formerly Polygon.io) for options data — never blocked
+// Uses Massive.com (formerly Polygon.io) for options + quotes
 
 const MASSIVE_KEY   = "kIjvBYnuGohoHzCO5wVmAjNuBoQjMwtr";
-const GEMINI_KEY    = process.env.GEMINI_KEY  || "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
+const GEMINI_KEY    = "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
 const SUPABASE_URL  = "https://qpcugczsqsjnodlgdver.supabase.co";
 const SERVICE_KEY   = "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
 const REST          = `${SUPABASE_URL}/rest/v1`;
+const MASSIVE_BASE  = "https://api.massive.com";  // new base URL after rebrand
 
-const OPTIONS_TTL_MS = 4 * 60 * 60 * 1000;  // 4 hours
-const QUOTES_TTL_MS  = 5 * 60 * 1000;        // 5 minutes
+const OPTIONS_TTL_MS = 4 * 60 * 60 * 1000;
+const QUOTES_TTL_MS  = 5 * 60 * 1000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -23,7 +24,7 @@ const DB_HEADERS = {
   "Content-Type": "application/json",
 };
 
-// ── Supabase cache helpers ─────────────────────────────────
+// ── Supabase cache ─────────────────────────────────────────
 
 async function dbGet(table, params) {
   try {
@@ -68,111 +69,108 @@ async function getCachedQuote(ticker) {
 }
 
 async function upsertOptions(ticker, expTs, data) {
-  await dbUpsert("options_cache", {
-    ticker, exp_ts: expTs, data, updated_at: new Date().toISOString()
-  });
+  await dbUpsert("options_cache", { ticker, exp_ts: expTs, data, updated_at: new Date().toISOString() });
 }
 
 async function upsertQuote(ticker, price) {
-  await dbUpsert("quotes_cache", {
-    ticker, price, updated_at: new Date().toISOString()
-  });
+  await dbUpsert("quotes_cache", { ticker, price, updated_at: new Date().toISOString() });
 }
 
-// ── Massive.com (Polygon) helpers ──────────────────────────
+// ── Massive.com API helpers ────────────────────────────────
+
+async function massiveGet(path) {
+  // Try new base first, fall back to polygon.io
+  for (const base of [MASSIVE_BASE, "https://api.polygon.io"]) {
+    try {
+      const url = `${base}${path}${path.includes("?") ? "&" : "?"}apiKey=${MASSIVE_KEY}`;
+      const r = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.status !== "ERROR" && j.status !== "NOT_AUTHORIZED") return j;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
 
 async function fetchMassiveQuote(ticker) {
-  try {
-    const r = await fetch(
-      `https://api.polygon.io/v2/last/trade/${ticker}?apiKey=${MASSIVE_KEY}`
-    );
-    const j = await r.json();
-    const price = j?.results?.p;
-    if (price) return parseFloat(price.toFixed(2));
+  // Try snapshot first (most reliable)
+  const snap = await massiveGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+  const price = snap?.ticker?.day?.c || snap?.ticker?.prevDay?.c || snap?.ticker?.lastTrade?.p;
+  if (price) return parseFloat(price.toFixed(2));
 
-    // Fallback: previous close
-    const r2 = await fetch(
-      `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${MASSIVE_KEY}`
-    );
-    const j2 = await r2.json();
-    const close = j2?.results?.[0]?.c;
-    if (close) return parseFloat(close.toFixed(2));
-  } catch (_) {}
+  // Fallback: previous close
+  const prev = await massiveGet(`/v2/aggs/ticker/${ticker}/prev?adjusted=true`);
+  const close = prev?.results?.[0]?.c;
+  if (close) return parseFloat(close.toFixed(2));
+
   return null;
 }
 
 async function fetchMassiveOptions(ticker, expDate) {
-  // expDate format: "2026-06-20"
-  try {
-    let url = `https://api.polygon.io/v3/snapshot/options/${ticker}?limit=250&apiKey=${MASSIVE_KEY}`;
-    if (expDate) url += `&expiration_date=${expDate}`;
+  // Get options snapshot with Greeks
+  let path = `/v3/snapshot/options/${ticker}?limit=250&contract_type=put`;
+  if (expDate) path += `&expiration_date=${expDate}`;
 
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const j = await r.json();
-    if (!j?.results?.length) return null;
+  const putsData = await massiveGet(path);
+  const callsPath = path.replace("contract_type=put", "contract_type=call");
+  const callsData = await massiveGet(callsPath);
 
-    // Transform Massive snapshot format → Yahoo-compatible format
-    // that WheelPicks frontend already knows how to parse
-    const puts = [];
-    const calls = [];
+  if (!putsData?.results?.length && !callsData?.results?.length) return null;
 
-    j.results.forEach(opt => {
+  function transformContracts(results) {
+    return (results || []).map(opt => {
       const d = opt.details || {};
       const g = opt.greeks || {};
       const day = opt.day || {};
-      const contract = {
-        strike:         d.strike_price,
-        lastPrice:      opt.last_trade?.price || day.close || 0,
-        bid:            opt.last_quote?.bid || 0,
-        ask:            opt.last_quote?.ask || 0,
-        openInterest:   opt.open_interest || 0,
-        volume:         day.volume || 0,
-        impliedVolatility: opt.implied_volatility || 0,
-        delta:          g.delta || 0,
-        theta:          g.theta || 0,
-        gamma:          g.gamma || 0,
-        vega:           g.vega || 0,
+      const quote = opt.last_quote || {};
+      const bid = parseFloat((quote.bid || 0).toFixed(2));
+      const ask = parseFloat((quote.ask || 0).toFixed(2));
+      const mid = bid > 0 && ask > 0 ? parseFloat(((bid + ask) / 2).toFixed(2)) : (day.close || 0);
+      return {
+        strike:            d.strike_price || 0,
+        lastPrice:         parseFloat((mid).toFixed(2)),
+        bid,
+        ask,
+        openInterest:      opt.open_interest || 0,
+        volume:            day.volume || 0,
+        impliedVolatility: parseFloat(((opt.implied_volatility || 0) * 100).toFixed(1)),
+        delta:             parseFloat((g.delta || 0).toFixed(4)),
+        theta:             parseFloat((g.theta || 0).toFixed(4)),
+        gamma:             parseFloat((g.gamma || 0).toFixed(4)),
+        vega:              parseFloat((g.vega || 0).toFixed(4)),
+        expiration:        d.expiration_date || expDate,
       };
-      // Use mid price as premium
-      if (contract.bid > 0 && contract.ask > 0) {
-        contract.lastPrice = parseFloat(((contract.bid + contract.ask) / 2).toFixed(2));
-      }
-      if (d.contract_type === "put") puts.push(contract);
-      else if (d.contract_type === "call") calls.push(contract);
-    });
-
-    // Sort by strike descending (ITM first for puts)
-    puts.sort((a, b) => b.strike - a.strike);
-    calls.sort((a, b) => a.strike - b.strike);
-
-    // Get unique expiration dates from results
-    const expDates = [...new Set(j.results.map(o => o.details?.expiration_date).filter(Boolean))];
-    const expTimestamps = expDates.map(d => Math.floor(new Date(d).getTime() / 1000));
-
-    // Wrap in Yahoo-compatible envelope so existing frontend code works unchanged
-    return {
-      optionChain: {
-        result: [{
-          underlyingSymbol: ticker,
-          expirationDates: expTimestamps,
-          strikes: [...new Set([...puts, ...calls].map(o => o.strike))].sort((a,b) => a-b),
-          quote: { regularMarketPrice: opt?.underlying?.price || 0 },
-          options: [{
-            expirationDate: expDate ? Math.floor(new Date(expDate).getTime()/1000) : expTimestamps[0],
-            puts,
-            calls
-          }]
-        }]
-      }
-    };
-  } catch (e) {
-    console.log("Massive options error:", e.message);
-    return null;
+    }).filter(c => c.strike > 0);
   }
+
+  const puts  = transformContracts(putsData?.results).sort((a,b) => b.strike - a.strike);
+  const calls = transformContracts(callsData?.results).sort((a,b) => a.strike - b.strike);
+
+  // Get current price from underlying
+  const underlyingPrice = putsData?.results?.[0]?.underlying?.price ||
+                          callsData?.results?.[0]?.underlying?.price || 0;
+
+  // Gather all unique expiration dates from results
+  const allResults = [...(putsData?.results || []), ...(callsData?.results || [])];
+  const expDates = [...new Set(allResults.map(o => o.details?.expiration_date).filter(Boolean))].sort();
+  const expTimestamps = expDates.map(d => Math.floor(new Date(d + "T16:00:00Z").getTime() / 1000));
+
+  const expTs = expDate ? Math.floor(new Date(expDate + "T16:00:00Z").getTime() / 1000) : (expTimestamps[0] || 0);
+
+  return {
+    optionChain: {
+      result: [{
+        underlyingSymbol: ticker,
+        expirationDates: expTimestamps,
+        strikes: [...new Set([...puts, ...calls].map(o => o.strike))].sort((a,b) => a-b),
+        quote: { regularMarketPrice: underlyingPrice },
+        options: [{ expirationDate: expTs, puts, calls }]
+      }]
+    }
+  };
 }
 
-// Convert unix timestamp to YYYY-MM-DD
 function tsToDate(ts) {
   const d = new Date(ts * 1000);
   return d.toISOString().split("T")[0];
@@ -212,33 +210,31 @@ export default async function handler(req, res) {
 
     // ── Quote ──────────────────────────────────────────────
     if (type === "quote") {
-      // 1. Cache
       const cached = await getCachedQuote(ticker);
       if (cached) {
         res.setHeader("X-Cache", "HIT");
-        return res.status(200).json({
-          chart: { result: [{ meta: { regularMarketPrice: cached } }] }
-        });
+        return res.status(200).json({ chart: { result: [{ meta: { regularMarketPrice: cached } }] } });
       }
-      // 2. Live from Massive
       const price = await fetchMassiveQuote(ticker);
       if (price) {
         upsertQuote(ticker, price);
         res.setHeader("X-Cache", "MISS");
-        return res.status(200).json({
-          chart: { result: [{ meta: { regularMarketPrice: price } }] }
-        });
+        return res.status(200).json({ chart: { result: [{ meta: { regularMarketPrice: price } }] } });
       }
       return res.status(200).json({ chart: { result: [] } });
     }
 
-    // ── News (still use Yahoo for news since it's not blocked) ──
+    // ── News ───────────────────────────────────────────────
     if (type === "news") {
-      const r = await fetch(
-        `https://query1.finance.yahoo.com/v1/finance/search?q=${ticker}&newsCount=5&quotesCount=0`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-      );
-      return res.status(200).json(await r.json());
+      try {
+        const r = await fetch(
+          `https://query1.finance.yahoo.com/v1/finance/search?q=${ticker}&newsCount=5&quotesCount=0`,
+          { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+        );
+        return res.status(200).json(await r.json());
+      } catch (_) {
+        return res.status(200).json({ news: [] });
+      }
     }
 
     // ── Options chain ──────────────────────────────────────
@@ -260,7 +256,7 @@ export default async function handler(req, res) {
       return res.status(200).json(live);
     }
 
-    // 3. Stale cache fallback
+    // 3. Stale cache
     const stale = await getStaleOptions(ticker, expTs);
     if (stale) {
       res.setHeader("X-Cache", "STALE");
@@ -275,3 +271,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
+
