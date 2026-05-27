@@ -1,7 +1,7 @@
 // WheelPicks API Proxy — Vercel Serverless Function
 // Uses Yahoo Finance with crumb+cookie auth (same method as ArkPicks)
 
-const GEMINI_KEY   = "AIzaSyDgHKgm3Xk3aU8IFrWgFSjGKVS3_QELl1U";
+const GEMINI_KEY   = "AIzaSyBKNlHzm1eutQGNdGu6DrsvGXmlU7W_Nek";
 const SUPABASE_URL = "https://qpcugczsqsjnodlgdver.supabase.co";
 const SERVICE_KEY  = "sb_secret_-Gklon3IGgPk70DZ5f9EUw_bEY5xH78";
 const REST         = `${SUPABASE_URL}/rest/v1`;
