@@ -225,14 +225,27 @@ export default async function handler(req, res) {
         return res.status(200).json({ chart: { result: [{ meta: { regularMarketPrice: cached } }] } });
       }
       const { crumb, cookie } = await getYahooCrumb();
-      const json = await yahooFetch(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`,
-        crumb, cookie
-      );
-      const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice;
+
+      // Fetch price + market cap in parallel
+      const [chartJson, summaryJson] = await Promise.all([
+        yahooFetch(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`, crumb, cookie),
+        yahooFetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=summaryDetail,price`, crumb, cookie)
+      ]);
+
+      const price = chartJson?.chart?.result?.[0]?.meta?.regularMarketPrice;
       if (price) upsertQuote(ticker, parseFloat(price.toFixed(2)));
+
+      // Extract market cap from quoteSummary
+      const mcapRaw = summaryJson?.quoteSummary?.result?.[0]?.price?.marketCap?.raw || 0;
+      const meta = chartJson?.chart?.result?.[0]?.meta || {};
+      if (mcapRaw > 0) meta.marketCap = mcapRaw;
+
+      // Return enriched response
+      const response = chartJson || { chart: { result: [] } };
+      if (response?.chart?.result?.[0]) response.chart.result[0].meta = meta;
+
       res.setHeader("X-Cache", "MISS");
-      return res.status(200).json(json || { chart: { result: [] } });
+      return res.status(200).json(response);
     }
 
     // ── News ───────────────────────────────────────────────
