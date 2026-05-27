@@ -334,8 +334,43 @@ export default async function handler(req, res) {
 
     // ── Cron/manual refresh triggers ──────────────────────────
     if (type === "refresh_cache") {
-      refreshAllAndReturnBestPicks();
-      return res.status(200).json({ ok: true, started: "options refresh" });
+      const offset = parseInt(req.query.offset || "0");
+      const batchSize = 10;
+      const batch = ALL_TICKERS.slice(offset, offset + batchSize);
+
+      if (batch.length === 0) {
+        return res.status(200).json({ ok: true, message: "All tickers cached", total: ALL_TICKERS.length });
+      }
+
+      const { crumb, cookie } = await getYahooCrumb();
+      let ok = 0, fail = 0;
+
+      for (const t of batch) {
+        try {
+          const cached = await getCachedOptions(t, 0);
+          if (cached) { ok++; continue; } // skip if already fresh
+
+          const url = `https://query1.finance.yahoo.com/v7/finance/options/${t}`;
+          const data = await yahooFetch(url, crumb, cookie);
+          if (data?.optionChain?.result?.length > 0) {
+            await upsertOptions(t, 0, data);
+            ok++;
+          } else fail++;
+        } catch (_) { fail++; }
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      const nextOffset = offset + batchSize;
+      const done = nextOffset >= ALL_TICKERS.length;
+
+      return res.status(200).json({
+        ok: true,
+        batch: `${offset}-${offset + batch.length}`,
+        cached: ok,
+        failed: fail,
+        next: done ? null : `?type=refresh_cache&offset=${nextOffset}`,
+        done
+      });
     }
     if (type === "refresh_quotes") {
       // Fire background quote refresh
