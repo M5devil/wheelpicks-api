@@ -332,6 +332,27 @@ export default async function handler(req, res) {
       return res.status(200).json({ results, cached_count: cached.length });
     }
 
+    // ── Cron/manual refresh triggers ──────────────────────────
+    if (type === "refresh_cache") {
+      refreshAllAndReturnBestPicks();
+      return res.status(200).json({ ok: true, started: "options refresh" });
+    }
+    if (type === "refresh_quotes") {
+      // Fire background quote refresh
+      (async () => {
+        const { crumb, cookie } = await getYahooCrumb();
+        for (const t of ALL_TICKERS) {
+          try {
+            const j = await yahooFetch(`https://query1.finance.yahoo.com/v8/finance/chart/${t}?interval=1m&range=1d`, crumb, cookie);
+            const price = j?.chart?.result?.[0]?.meta?.regularMarketPrice;
+            if (price) await upsertQuote(t, parseFloat(price.toFixed(2)));
+          } catch (_) {}
+          await new Promise(r => setTimeout(r, 150));
+        }
+      })();
+      return res.status(200).json({ ok: true, started: "quotes refresh" });
+    }
+
     // ── Gemini AI ──────────────────────────────────────────
     if (type === "gemini_news" || type === "gemini_sellers") {
       const body = req.body || {};
@@ -432,4 +453,4 @@ export default async function handler(req, res) {
     console.error("Handler error:", err.message);
     return res.status(500).json({ error: err.message });
   }
-        }
+}
