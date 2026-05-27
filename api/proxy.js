@@ -185,6 +185,99 @@ async function yahooFetch(url, crumb, cookie) {
   return null;
 }
 
+// ── Best pick calculator ───────────────────────────────────
+
+function findBestPick(puts, price, dte) {
+  if (!puts || !puts.length || !price || !dte) return null;
+  const T = dte / 365;
+  let bestStrike = 0, bestPrem = 0, bestRoc = 0, bestDelta = 0;
+  let minDiff = 999;
+
+  // Filter to OTM puts within 30% of price
+  const otm = puts.filter(c => c.strike < price * 1.05 && c.strike > price * 0.60);
+  if (!otm.length) return null;
+
+  otm.forEach(c => {
+    const bid = c.bid || 0, ask = c.ask || 0;
+    const prem = bid > 0 && ask > 0 ? (bid + ask) / 2 : (c.lastPrice || 0);
+    if (prem <= 0 || c.strike <= 0) return;
+    const delta = Math.abs(c.delta || 0);
+    const diff = Math.abs(delta - 0.30);
+    if (diff < minDiff) {
+      minDiff = diff;
+      bestStrike = c.strike;
+      bestPrem = parseFloat(prem.toFixed(2));
+      bestRoc = parseFloat(((prem / c.strike) * 100).toFixed(2));
+      bestDelta = delta;
+    }
+  });
+
+  return bestStrike > 0 ? { strike: bestStrike, premium: bestPrem, roc: bestRoc } : null;
+}
+
+async function refreshAllAndReturnBestPicks() {
+  const { crumb, cookie } = await getYahooCrumb();
+  const results = {};
+  const now = Math.floor(Date.now() / 1000);
+
+  for (const ticker of ALL_TICKERS) {
+    try {
+      // Check cache first
+      const cached = await getCachedOptions(ticker, 0);
+      let data = cached;
+
+      if (!data) {
+        const url = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}`;
+        data = await yahooFetch(url, crumb, cookie);
+        if (data?.optionChain?.result?.length > 0) {
+          await upsertOptions(ticker, 0, data);
+        }
+      }
+
+      if (!data?.optionChain?.result?.length) continue;
+
+      const result = data.optionChain.result[0];
+      const price = result.quote?.regularMarketPrice || 0;
+      const expirations = (result.expirationDates || []).filter(ts => ts > now).slice(0, 8);
+
+      // Find best expiration (closest to 30-45 DTE)
+      let bestExpTs = null, bestDteDiff = 999;
+      expirations.forEach(ts => {
+        const dte = Math.round((ts - now) / 86400);
+        const diff = Math.abs(dte - 38);
+        if (diff < bestDteDiff) { bestDteDiff = diff; bestExpTs = ts; }
+      });
+
+      if (!bestExpTs) continue;
+      const dte = Math.round((bestExpTs - now) / 86400);
+
+      // Get options for best expiration
+      let expData = await getCachedOptions(ticker, bestExpTs);
+      if (!expData) {
+        expData = await yahooFetch(
+          `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${bestExpTs}`,
+          crumb, cookie
+        );
+        if (expData?.optionChain?.result?.length > 0) {
+          await upsertOptions(ticker, bestExpTs, expData);
+        }
+      }
+
+      if (!expData?.optionChain?.result?.length) continue;
+
+      const opts = expData.optionChain.result[0].options?.[0] || {};
+      const pick = findBestPick(opts.puts, price, dte);
+      if (pick) {
+        results[ticker] = { ...pick, dte, price };
+      }
+    } catch (_) {}
+
+    await new Promise(r => setTimeout(r, 400)); // stagger to avoid rate limiting
+  }
+
+  return results;
+}
+
 // ── Main handler ───────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -200,6 +293,44 @@ export default async function handler(req, res) {
   const { ticker = "", type = "quote", exp = "" } = req.query;
 
   try {
+
+    // ── Best picks batch fetch ─────────────────────────────
+    if (type === "best_picks") {
+      const cached = await dbGet("options_cache", `exp_ts=eq.0&select=ticker,data,updated_at&limit=84`);
+      const now = Math.floor(Date.now() / 1000);
+      const results = {};
+
+      cached.forEach(row => {
+        try {
+          const data = row.data;
+          if (!data?.optionChain?.result?.length) return;
+          const result = data.optionChain.result[0];
+          const price = result.quote?.regularMarketPrice || 0;
+          const expirations = (result.expirationDates || []).filter(ts => ts > now);
+          if (!expirations.length) return;
+
+          let bestExpTs = expirations[0], bestDiff = 999;
+          expirations.forEach(ts => {
+            const diff = Math.abs(Math.round((ts - now) / 86400) - 38);
+            if (diff < bestDiff) { bestDiff = diff; bestExpTs = ts; }
+          });
+
+          const dte = Math.round((bestExpTs - now) / 86400);
+          const opts = result.options?.[0] || {};
+          const pick = findBestPick(opts.puts, price, dte);
+          if (pick) results[row.ticker] = { ...pick, dte };
+        } catch (_) {}
+      });
+
+      // Fire background refresh if cache is stale or sparse
+      const ages = cached.map(r => Date.now() - new Date(r.updated_at).getTime());
+      const maxAge = ages.length ? Math.max(...ages) : Infinity;
+      if (maxAge > OPTIONS_TTL_MS || cached.length < 40) {
+        refreshAllAndReturnBestPicks();
+      }
+
+      return res.status(200).json({ results, cached_count: cached.length });
+    }
 
     // ── Gemini AI ──────────────────────────────────────────
     if (type === "gemini_news" || type === "gemini_sellers") {
@@ -301,4 +432,4 @@ export default async function handler(req, res) {
     console.error("Handler error:", err.message);
     return res.status(500).json({ error: err.message });
   }
-}
+        }
