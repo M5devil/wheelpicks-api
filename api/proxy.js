@@ -9,6 +9,16 @@ const REST         = `${SUPABASE_URL}/rest/v1`;
 const OPTIONS_TTL_MS = 4 * 60 * 60 * 1000;
 const QUOTES_TTL_MS  = 5 * 60 * 1000;
 
+const ALL_TICKERS = [
+  "CLX","RBLX","NKE","MCD","NFLX","HSY","LCID","SHOP","HD","GIS","JNJ","F","SOFI",
+  "META","IBM","MMM","PYPL","HRL","T","PLTR","BMY","SLV","PFE","CHD","CCL","MA","DIS",
+  "MRK","CPB","PG","KMB","ABBV","SJM","NVDA","O","KHC","D","MSFT","CVX","CL","JPM",
+  "COIN","CRM","TSLA","ABNB","BTI","PM","DKNG","BAC","COST","WMT","AAL","KO","DAL",
+  "XLE","LLY","AAPL","MO","ROKU","PINS","AMD","CAT","CSCO","AMZN","ZM","GOOGL","INTC",
+  "SQ","K","UPWK","RIVN","TMO","TLT","SNOW","UBER","WFC","PEP","WBD","XLF","XOM","V",
+  "SBUX","UNH","XLK"
+];
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
